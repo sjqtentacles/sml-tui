@@ -1,0 +1,7 @@
+$(SML_LIB)/basis/basis.mlb
+
+../lib/github.com/sjqtentacles/sml-tui/sources.mlb
+../lib/github.com/sjqtentacles/sml-image/image.mlb
+
+render.sml
+dashboard.sml
