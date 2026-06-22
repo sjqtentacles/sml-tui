@@ -8,6 +8,8 @@ struct
   type rgba = { r : real, g : real, b : real, a : real }
   type hsv  = { h : real, s : real, v : real }
   type hsl  = { h : real, s : real, l : real }
+  type lab  = { l : real, a : real, b : real }
+  type lch  = { l : real, c : real, h : real }
 
   fun clamp01 (x : real) = if x < 0.0 then 0.0 else if x > 1.0 then 1.0 else x
   fun wrapHue h =
@@ -108,6 +110,136 @@ struct
     { r = srgbToLinear r, g = srgbToLinear g, b = srgbToLinear b }
   fun rgbToSrgb ({r,g,b} : rgb) : rgb =
     { r = linearToSrgb r, g = linearToSrgb g, b = linearToSrgb b }
+
+  (* --- CIE L*a*b* (D65) --- *)
+
+  val pi = 3.14159265358979323846
+  fun degToRad d = d * pi / 180.0
+  fun radToDeg r = r * 180.0 / pi
+
+  (* D65 white point in the same [0,1]-Y scale the matrices below produce. *)
+  val xn = 0.95047
+  val yn = 1.0
+  val zn = 1.08883
+
+  (* CIE Lab nonlinearity and its inverse. delta = 6/29. *)
+  val labDelta  = 6.0 / 29.0
+  val labDelta3 = labDelta * labDelta * labDelta            (* (6/29)^3 *)
+  fun labF t =
+    if t > labDelta3 then Math.pow (t, 1.0 / 3.0)
+    else t / (3.0 * labDelta * labDelta) + 4.0 / 29.0
+  fun labFinv t =
+    if t > labDelta then t * t * t
+    else 3.0 * labDelta * labDelta * (t - 4.0 / 29.0)
+
+  fun toLab (c : rgb) : lab =
+    let
+      val {r, g, b} = rgbToLinear c
+      val x = 0.4124564 * r + 0.3575761 * g + 0.1804375 * b
+      val y = 0.2126729 * r + 0.7151522 * g + 0.0721750 * b
+      val z = 0.0193339 * r + 0.1191920 * g + 0.9503041 * b
+      val fx = labF (x / xn)
+      val fy = labF (y / yn)
+      val fz = labF (z / zn)
+    in
+      { l = 116.0 * fy - 16.0, a = 500.0 * (fx - fy), b = 200.0 * (fy - fz) }
+    end
+
+  fun fromLab ({l, a, b} : lab) : rgb =
+    let
+      val fy = (l + 16.0) / 116.0
+      val fx = fy + a / 500.0
+      val fz = fy - b / 200.0
+      val x = xn * labFinv fx
+      val y = yn * labFinv fy
+      val z = zn * labFinv fz
+      val r =  3.2404542 * x - 1.5371385 * y - 0.4985314 * z
+      val g = ~0.9692660 * x + 1.8760108 * y + 0.0415560 * z
+      val bch = 0.0556434 * x - 0.2040259 * y + 1.0572252 * z
+    in
+      clampRgb (rgbToSrgb { r = r, g = g, b = bch })
+    end
+
+  fun labToLch ({l, a, b} : lab) : lch =
+    let
+      val c = Math.sqrt (a * a + b * b)
+      val h = if Real.== (c, 0.0) then 0.0 else wrapHue (radToDeg (Math.atan2 (b, a)))
+    in
+      { l = l, c = c, h = h }
+    end
+
+  fun lchToLab ({l, c, h} : lch) : lab =
+    let val hr = degToRad h
+    in { l = l, a = c * Math.cos hr, b = c * Math.sin hr } end
+
+  fun toLch c = labToLch (toLab c)
+  fun fromLch lch = fromLab (lchToLab lch)
+
+  fun deltaE76 ({l=l1,a=a1,b=b1} : lab, {l=l2,a=a2,b=b2} : lab) =
+    let val dl = l1 - l2 and da = a1 - a2 and db = b1 - b2
+    in Math.sqrt (dl * dl + da * da + db * db) end
+
+  fun deltaE (c1, c2) = deltaE76 (toLab c1, toLab c2)
+
+  fun deltaE2000 ({l=l1,a=a1,b=b1} : lab, {l=l2,a=a2,b=b2} : lab) =
+    let
+      fun pow7 x = Math.pow (x, 7.0)
+      val c1 = Math.sqrt (a1 * a1 + b1 * b1)
+      val c2 = Math.sqrt (a2 * a2 + b2 * b2)
+      val cbar = (c1 + c2) / 2.0
+      val cbar7 = pow7 cbar
+      val g = 0.5 * (1.0 - Math.sqrt (cbar7 / (cbar7 + pow7 25.0)))
+      val a1p = (1.0 + g) * a1
+      val a2p = (1.0 + g) * a2
+      val c1p = Math.sqrt (a1p * a1p + b1 * b1)
+      val c2p = Math.sqrt (a2p * a2p + b2 * b2)
+      fun hp (a, b) =
+        if Real.== (a, 0.0) andalso Real.== (b, 0.0) then 0.0
+        else wrapHue (radToDeg (Math.atan2 (b, a)))
+      val h1p = hp (a1p, b1)
+      val h2p = hp (a2p, b2)
+      val dLp = l2 - l1
+      val dCp = c2p - c1p
+      val zeroChroma = Real.== (c1p * c2p, 0.0)
+      val dhp =
+        if zeroChroma then 0.0
+        else
+          let val d = h2p - h1p
+          in if Real.abs d <= 180.0 then d
+             else if d > 180.0 then d - 360.0
+             else d + 360.0
+          end
+      val dHp = 2.0 * Math.sqrt (c1p * c2p) * Math.sin (degToRad (dhp / 2.0))
+      val Lbarp = (l1 + l2) / 2.0
+      val Cbarp = (c1p + c2p) / 2.0
+      val hbarp =
+        if zeroChroma then h1p + h2p
+        else if Real.abs (h1p - h2p) <= 180.0 then (h1p + h2p) / 2.0
+        else if (h1p + h2p) < 360.0 then (h1p + h2p + 360.0) / 2.0
+        else (h1p + h2p - 360.0) / 2.0
+      val t = 1.0
+              - 0.17 * Math.cos (degToRad (hbarp - 30.0))
+              + 0.24 * Math.cos (degToRad (2.0 * hbarp))
+              + 0.32 * Math.cos (degToRad (3.0 * hbarp + 6.0))
+              - 0.20 * Math.cos (degToRad (4.0 * hbarp - 63.0))
+      val dTheta = 30.0 * Math.exp (~(Math.pow ((hbarp - 275.0) / 25.0, 2.0)))
+      val Cbarp7 = pow7 Cbarp
+      val Rc = 2.0 * Math.sqrt (Cbarp7 / (Cbarp7 + pow7 25.0))
+      val dL50 = Lbarp - 50.0
+      val Sl = 1.0 + (0.015 * dL50 * dL50) / Math.sqrt (20.0 + dL50 * dL50)
+      val Sc = 1.0 + 0.045 * Cbarp
+      val Sh = 1.0 + 0.015 * Cbarp * t
+      val Rt = ~(Math.sin (degToRad (2.0 * dTheta))) * Rc
+      val tL = dLp / Sl
+      val tC = dCp / Sc
+      val tH = dHp / Sh
+    in
+      Math.sqrt (tL * tL + tC * tC + tH * tH + Rt * tC * tH)
+    end
+
+  fun approxLab eps ({l=l1,a=a1,b=b1} : lab, {l=l2,a=a2,b=b2} : lab) =
+    Real.abs (l1-l2) <= eps andalso Real.abs (a1-a2) <= eps
+    andalso Real.abs (b1-b2) <= eps
 
   fun toByte x = Word32.fromInt (Real.round (clamp01 x * 255.0))
 
